@@ -1,4 +1,16 @@
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -120,6 +132,69 @@ describe("daemon supervisor ownership renewal", () => {
 		expect(readJson(ownerPath).token).toBe("successor-token");
 		// Ownership is marked lost: even a healthy-looking record no longer revives it.
 		await expect(ownership.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+		await ownership.release();
+	});
+
+	it("treats a transient scope read failure as retryable, not lost", async () => {
+		if (process.getuid?.() === 0) return;
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const directory = ownerDir(paths, ownership.record.generation);
+		rmSync(join(directory, "owner.json"), { force: true });
+		chmodSync(join(directory, "scope.json"), 0o000);
+
+		const transient = await ownership
+			.assertCurrent()
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error & { code?: string });
+		if (!transient) throw new Error("assertCurrent did not fail while scope.json was unreadable");
+		expect(transient.code).not.toBe("supervisor_generation_stale");
+
+		chmodSync(join(directory, "scope.json"), 0o600);
+		rmSync(join(directory, "scope.json"), { force: true });
+		await expect(ownership.assertCurrent()).resolves.toBeUndefined();
+		expect(readJson(join(directory, "owner.json")).token).toBe(ownership.record.token);
+		await ownership.release();
+	});
+
+	it("reclaims a dead conflicting peer directory during self-heal", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const directory = ownerDir(paths, ownership.record.generation);
+		const ownRecord = readJson(join(directory, "owner.json"));
+		const ownScope = readJson(join(directory, "scope.json"));
+		const exited = spawnSync("true");
+		const deadPid = exited.pid ?? 999_999;
+		const peerDir = ownerDir(paths, "dead-peer");
+		mkdirSync(peerDir, { recursive: true });
+		writeFileSync(
+			join(peerDir, "owner.json"),
+			`${JSON.stringify({ ...ownRecord, generation: "dead-peer", token: "dead-peer-token", pid: deadPid }, null, 2)}\n`,
+		);
+		writeFileSync(
+			join(peerDir, "scope.json"),
+			`${JSON.stringify({ ...ownScope, generation: "dead-peer", token: "dead-peer-token" }, null, 2)}\n`,
+		);
+		rmSync(directory, { recursive: true, force: true });
+
+		await expect(ownership.assertCurrent()).resolves.toBeUndefined();
+
+		expect(existsSync(peerDir)).toBe(false);
+		expect(readJson(join(directory, "owner.json")).token).toBe(ownership.record.token);
+		await ownership.release();
+	});
+
+	it("heals over corrupt residual scope bytes in its own directory", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const directory = ownerDir(paths, ownership.record.generation);
+		rmSync(join(directory, "owner.json"), { force: true });
+		writeFileSync(join(directory, "scope.json"), "{ garbage\n");
+
+		await expect(ownership.assertCurrent()).resolves.toBeUndefined();
+
+		expect(readJson(join(directory, "owner.json")).token).toBe(ownership.record.token);
+		expect(readJson(join(directory, "scope.json")).token).toBe(ownership.record.token);
 		await ownership.release();
 	});
 

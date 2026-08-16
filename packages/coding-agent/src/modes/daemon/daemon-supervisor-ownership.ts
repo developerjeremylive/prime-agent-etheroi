@@ -235,42 +235,19 @@ class DaemonSupervisorOwnership {
 			this.renewMatchingRecord(current);
 			return;
 		}
-		// Distinguish the reaper case (owner.json ENOENT) from a present but
-		// invalid record (a real conflict: someone replaced our file — fatal)
-		// and from a transient read failure (EMFILE/EACCES — must not wedge
-		// the owner, so it surfaces as a non-fatal error and renewal retries).
-		// readOwnerRecord also swallows transient read errors, so when this
-		// probe read succeeds the bytes are re-validated: our own matching
-		// record renews normally instead of going fatal.
-		let probed: string | undefined;
-		try {
-			probed = readFileSync(resolve(this.ownerDirectory, "owner.json"), "utf8");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				throw new Error(`Could not read daemon supervisor owner record: ${String(error)}`);
-			}
-		}
-		if (probed !== undefined) {
-			let value: unknown;
-			try {
-				value = JSON.parse(probed);
-			} catch {
-				throw this.ownershipLostError();
-			}
-			if (!isDaemonSupervisorOwnerRecord(value)) {
-				throw this.ownershipLostError();
-			}
-			this.renewMatchingRecord(value);
+		// Self-heal gate. Fatal only when a successfully read record or scope
+		// carries a foreign token, or a live conflicting owner holds the scope.
+		// Read errors are transient (renewal retries); residue in our own
+		// directory and dead conflicting peers are healable.
+		const ownRecord = this.probeOwnRecord();
+		if (ownRecord) {
+			this.renewMatchingRecord(ownRecord);
 			return;
 		}
-		if (
-			existsSync(resolve(this.ownerDirectory, "scope.json")) &&
-			readOwnerScope(this.ownerDirectory)?.token !== this.record.token
-		) {
+		const scope = this.probeOwnScope();
+		if (scope && scope.token !== this.record.token) {
 			throw this.ownershipLostError();
 		}
-		// record.pid was captured from this process at acquire; a transient
-		// process-identity probe (ps subprocess) must never wedge the owner here.
 		if (this.record.pid !== process.pid) {
 			throw this.ownershipLostError();
 		}
@@ -280,18 +257,80 @@ class DaemonSupervisorOwnership {
 			}
 			let owner: DaemonSupervisorOwnerRecord | undefined;
 			try {
-				owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, this.record));
-			} catch {
+				owner = readOwnerRecordForScope(directory, (candidate) => ownerConflicts(candidate, this.record));
+			} catch (error) {
+				throw new Error(`Could not scan daemon supervisor registry: ${String(error)}`);
+			}
+			if (!owner || !ownerConflicts(owner, this.record)) {
+				continue;
+			}
+			if (isProcessIdentityAlive(owner)) {
 				throw this.ownershipLostError();
 			}
-			if (owner && ownerConflicts(owner, this.record)) {
-				throw this.ownershipLostError();
-			}
+			const staleDirectory = `${directory}.stale-${randomUUID()}`;
+			renameSync(directory, staleDirectory);
+			rmSync(staleDirectory, { recursive: true, force: true });
 		}
 		mkdirSync(this.ownerDirectory, { recursive: true, mode: 0o700 });
 		this.record.updatedAt = new Date().toISOString();
 		writeOwnerScope(this.ownerDirectory, this.record);
 		writeOwnerRecord(this.ownerDirectory, this.record);
+	}
+
+	/**
+	 * Reads owner.json without swallowing read errors: ENOENT means the record
+	 * is absent, other errnos are transient, and readable-but-foreign or
+	 * readable-but-invalid content is a fatal conflict. A readable record that
+	 * matches ours is returned for a normal renew.
+	 */
+	private probeOwnRecord(): DaemonSupervisorOwnerRecord | undefined {
+		let bytes: string;
+		try {
+			bytes = readFileSync(resolve(this.ownerDirectory, "owner.json"), "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return undefined;
+			}
+			throw new Error(`Could not read daemon supervisor owner record: ${String(error)}`);
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(bytes);
+		} catch {
+			throw this.ownershipLostError();
+		}
+		if (!isDaemonSupervisorOwnerRecord(value)) {
+			throw this.ownershipLostError();
+		}
+		return value;
+	}
+
+	/**
+	 * Reads scope.json without swallowing read errors: ENOENT means no scope,
+	 * other errnos are transient, and unparseable or invalid content in our own
+	 * directory is residue the heal overwrites. Only a valid scope is returned
+	 * for the token comparison.
+	 */
+	private probeOwnScope(): DaemonSupervisorOwnerScope | undefined {
+		let bytes: string;
+		try {
+			bytes = readFileSync(resolve(this.ownerDirectory, "scope.json"), "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return undefined;
+			}
+			throw new Error(`Could not read daemon supervisor owner scope: ${String(error)}`);
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(bytes);
+		} catch {
+			return undefined;
+		}
+		if (!isDaemonSupervisorOwnerScope(value)) {
+			return undefined;
+		}
+		return ownerDirectoryPath(this.registryDir, value.generation) === this.ownerDirectory ? value : undefined;
 	}
 
 	private renewMatchingRecord(current: DaemonSupervisorOwnerRecord): void {
