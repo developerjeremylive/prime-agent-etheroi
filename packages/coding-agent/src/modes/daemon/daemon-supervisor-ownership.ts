@@ -242,9 +242,20 @@ class DaemonSupervisorOwnership {
 			this.record.updatedAt = current.updatedAt;
 			return;
 		}
-		// A present-but-unreadable owner.json is a conflict, not a reap.
-		if (existsSync(resolve(this.ownerDirectory, "owner.json"))) {
+		// Distinguish the reaper case (owner.json ENOENT) from a present but
+		// invalid record (a real conflict: someone replaced our file — fatal)
+		// and from a transient read failure (EMFILE/EACCES — must not wedge
+		// the owner, so it surfaces as a non-fatal error and renewal retries).
+		try {
+			readFileSync(resolve(this.ownerDirectory, "owner.json"));
 			throw this.ownershipLostError();
+		} catch (error) {
+			if (error instanceof DaemonSupervisorOwnershipLostError) {
+				throw error;
+			}
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				throw new Error(`Could not read daemon supervisor owner record: ${String(error)}`);
+			}
 		}
 		if (
 			existsSync(resolve(this.ownerDirectory, "scope.json")) &&
@@ -252,14 +263,21 @@ class DaemonSupervisorOwnership {
 		) {
 			throw this.ownershipLostError();
 		}
-		if (this.record.pid !== process.pid || !matchesExactProcessIdentity(this.record)) {
+		// record.pid was captured from this process at acquire; a transient
+		// process-identity probe (ps subprocess) must never wedge the owner here.
+		if (this.record.pid !== process.pid) {
 			throw this.ownershipLostError();
 		}
 		for (const directory of listOwnerDirectories(this.registryDir)) {
 			if (directory === this.ownerDirectory) {
 				continue;
 			}
-			const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, this.record));
+			let owner: DaemonSupervisorOwnerRecord | undefined;
+			try {
+				owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, this.record));
+			} catch {
+				throw this.ownershipLostError();
+			}
 			if (owner && ownerConflicts(owner, this.record)) {
 				throw this.ownershipLostError();
 			}

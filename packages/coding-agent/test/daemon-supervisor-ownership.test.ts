@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -133,6 +133,43 @@ describe("daemon supervisor ownership renewal", () => {
 		expect(readJson(join(ownerDir(paths, "successor-owner"), "owner.json")).token).toBe(successor.record.token);
 
 		await successor.release();
+		await ownership.release();
+	});
+
+	it("does not mark ownership lost after a transient renew failure", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const movedRegistry = `${paths.registryDir}.moved`;
+		renameSync(paths.registryDir, movedRegistry);
+		writeFileSync(paths.registryDir, "blocked");
+
+		const transient = await triggerRenew(ownership)
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error & { code?: string });
+		if (!transient) throw new Error("renew did not fail while the registry was blocked");
+		expect(transient.code).not.toBe("supervisor_generation_stale");
+
+		rmSync(paths.registryDir, { force: true });
+		renameSync(movedRegistry, paths.registryDir);
+		rmSync(ownerDir(paths, ownership.record.generation), { recursive: true, force: true });
+		// The real isFatalError wiring must have left the renewal alive: it still self-heals.
+		await expect(ownership.assertCurrent()).resolves.toBeUndefined();
+		expect(readJson(join(ownerDir(paths, ownership.record.generation), "owner.json")).token).toBe(
+			ownership.record.token,
+		);
+		await ownership.release();
+	});
+
+	it("preserves the owner phase across renewal", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		await ownership.updatePhase("owner");
+		const ownerPath = join(ownerDir(paths, ownership.record.generation), "owner.json");
+
+		await triggerRenew(ownership);
+
+		expect((readJson(ownerPath) as OwnerRecord & { phase?: string }).phase).toBe("owner");
+		expect(ownership.record.phase).toBe("owner");
 		await ownership.release();
 	});
 
