@@ -281,7 +281,10 @@ class DaemonSupervisorOwnership {
 	 * Reads owner.json without swallowing read errors: ENOENT means the record
 	 * is absent, other errnos are transient, and readable-but-foreign or
 	 * readable-but-invalid content is a fatal conflict. A readable record that
-	 * matches ours is returned for a normal renew.
+	 * matches ours is returned for a normal renew. Unlike scope.json residue
+	 * (healable), invalid owner.json content is intentionally fatal: it is the
+	 * authoritative token-bearing file and rename-atomic writes cannot tear,
+	 * so garbage there implies tampering or filesystem corruption.
 	 */
 	private probeOwnRecord(): DaemonSupervisorOwnerRecord | undefined {
 		let bytes: string;
@@ -330,7 +333,11 @@ class DaemonSupervisorOwnership {
 		if (!isDaemonSupervisorOwnerScope(value)) {
 			return undefined;
 		}
-		return ownerDirectoryPath(this.registryDir, value.generation) === this.ownerDirectory ? value : undefined;
+		try {
+			return ownerDirectoryPath(this.registryDir, value.generation) === this.ownerDirectory ? value : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private renewMatchingRecord(current: DaemonSupervisorOwnerRecord): void {

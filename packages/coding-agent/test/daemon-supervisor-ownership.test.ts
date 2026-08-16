@@ -198,6 +198,24 @@ describe("daemon supervisor ownership renewal", () => {
 		await ownership.release();
 	});
 
+	it("heals over residual scope bytes carrying a path-unsafe generation", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const directory = ownerDir(paths, ownership.record.generation);
+		const scope = readJson(join(directory, "scope.json"));
+		rmSync(join(directory, "owner.json"), { force: true });
+		writeFileSync(
+			join(directory, "scope.json"),
+			`${JSON.stringify({ ...scope, generation: "../escape" }, null, 2)}\n`,
+		);
+
+		await expect(ownership.assertCurrent()).resolves.toBeUndefined();
+
+		expect(readJson(join(directory, "owner.json")).token).toBe(ownership.record.token);
+		expect(readJson(join(directory, "scope.json")).token).toBe(ownership.record.token);
+		await ownership.release();
+	});
+
 	it("does not self-heal when a live conflicting owner claimed the scope after the reap", async () => {
 		const paths = createPaths();
 		const ownership = await acquire(paths);
