@@ -232,30 +232,36 @@ class DaemonSupervisorOwnership {
 	private renewUnderGuard(): void {
 		const current = readOwnerRecord(this.ownerDirectory);
 		if (current) {
-			if (!sameOwnerRecord(current, this.record)) {
-				throw this.ownershipLostError();
-			}
-			current.updatedAt = new Date().toISOString();
-			writeOwnerScope(this.ownerDirectory, current);
-			writeOwnerRecord(this.ownerDirectory, current);
-			this.record.phase = current.phase;
-			this.record.updatedAt = current.updatedAt;
+			this.renewMatchingRecord(current);
 			return;
 		}
 		// Distinguish the reaper case (owner.json ENOENT) from a present but
 		// invalid record (a real conflict: someone replaced our file — fatal)
 		// and from a transient read failure (EMFILE/EACCES — must not wedge
 		// the owner, so it surfaces as a non-fatal error and renewal retries).
+		// readOwnerRecord also swallows transient read errors, so when this
+		// probe read succeeds the bytes are re-validated: our own matching
+		// record renews normally instead of going fatal.
+		let probed: string | undefined;
 		try {
-			readFileSync(resolve(this.ownerDirectory, "owner.json"));
-			throw this.ownershipLostError();
+			probed = readFileSync(resolve(this.ownerDirectory, "owner.json"), "utf8");
 		} catch (error) {
-			if (error instanceof DaemonSupervisorOwnershipLostError) {
-				throw error;
-			}
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				throw new Error(`Could not read daemon supervisor owner record: ${String(error)}`);
 			}
+		}
+		if (probed !== undefined) {
+			let value: unknown;
+			try {
+				value = JSON.parse(probed);
+			} catch {
+				throw this.ownershipLostError();
+			}
+			if (!isDaemonSupervisorOwnerRecord(value)) {
+				throw this.ownershipLostError();
+			}
+			this.renewMatchingRecord(value);
+			return;
 		}
 		if (
 			existsSync(resolve(this.ownerDirectory, "scope.json")) &&
@@ -286,6 +292,17 @@ class DaemonSupervisorOwnership {
 		this.record.updatedAt = new Date().toISOString();
 		writeOwnerScope(this.ownerDirectory, this.record);
 		writeOwnerRecord(this.ownerDirectory, this.record);
+	}
+
+	private renewMatchingRecord(current: DaemonSupervisorOwnerRecord): void {
+		if (!sameOwnerRecord(current, this.record)) {
+			throw this.ownershipLostError();
+		}
+		current.updatedAt = new Date().toISOString();
+		writeOwnerScope(this.ownerDirectory, current);
+		writeOwnerRecord(this.ownerDirectory, current);
+		this.record.phase = current.phase;
+		this.record.updatedAt = current.updatedAt;
 	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
