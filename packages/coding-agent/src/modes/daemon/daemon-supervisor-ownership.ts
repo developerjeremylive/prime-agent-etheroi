@@ -26,6 +26,11 @@ const SHUTDOWN_ADMISSION_FILE_NAME = "shutdown-admission.json";
 const SHUTDOWN_ADMISSION_LEASE_MS = 5000;
 const SHUTDOWN_ADMISSION_REFRESH_MS = 1000;
 const SHUTDOWN_ADMISSION_WAIT_MS = 50;
+/**
+ * External tmp cleaners (macOS com.apple.bsd.dirhelper) delete files older
+ * than three days under $TMPDIR; hourly rewrites keep the record fresh.
+ */
+const OWNER_RENEWAL_MS = 3_600_000;
 
 type DaemonSupervisorOwnerPhase = "starting" | "owner" | "stopping";
 
@@ -175,21 +180,83 @@ class RenewableRegistryRecord {
 
 class DaemonSupervisorOwnership {
 	private released = false;
+	private readonly renewal: RenewableRegistryRecord;
 
 	constructor(
 		readonly record: DaemonSupervisorOwnerRecord,
 		private readonly registryDir: string,
 		private readonly ownerDirectory: string,
-	) {}
+	) {
+		this.renewal = new RenewableRegistryRecord(
+			registryDir,
+			OWNER_RENEWAL_MS,
+			() => this.renewUnderGuard(),
+			() => this.ownershipLostError(),
+			(error) => error instanceof DaemonSupervisorOwnershipLostError,
+		);
+	}
+
+	private ownershipLostError(): DaemonSupervisorOwnershipLostError {
+		return new DaemonSupervisorOwnershipLostError(this.record.generation);
+	}
 
 	async assertCurrent(): Promise<void> {
-		if (this.released) {
-			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+		if (this.released || this.renewal.isLost) {
+			throw this.ownershipLostError();
 		}
 		const current = readOwnerRecord(this.ownerDirectory);
-		if (!current || !sameOwnerRecord(current, this.record)) {
-			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+		if (current && sameOwnerRecord(current, this.record)) {
+			return;
 		}
+		await this.renewal.assertOrRenew();
+	}
+
+	/**
+	 * Rewrites owner.json and scope.json with fresh mtimes so external tmp
+	 * cleaners (macOS dirhelper reaps files >3 days old under $TMPDIR) never
+	 * see a stale record. A reaped (absent) record is self-healed when it can
+	 * only belong to this live process; a mismatched record is a real conflict
+	 * and stays fatal.
+	 */
+	private renewUnderGuard(): void {
+		const current = readOwnerRecord(this.ownerDirectory);
+		if (current) {
+			if (!sameOwnerRecord(current, this.record)) {
+				throw this.ownershipLostError();
+			}
+			current.updatedAt = new Date().toISOString();
+			writeOwnerScope(this.ownerDirectory, current);
+			writeOwnerRecord(this.ownerDirectory, current);
+			this.record.phase = current.phase;
+			this.record.updatedAt = current.updatedAt;
+			return;
+		}
+		// A present-but-unreadable owner.json is a conflict, not a reap.
+		if (existsSync(resolve(this.ownerDirectory, "owner.json"))) {
+			throw this.ownershipLostError();
+		}
+		if (
+			existsSync(resolve(this.ownerDirectory, "scope.json")) &&
+			readOwnerScope(this.ownerDirectory)?.token !== this.record.token
+		) {
+			throw this.ownershipLostError();
+		}
+		if (this.record.pid !== process.pid || !matchesExactProcessIdentity(this.record)) {
+			throw this.ownershipLostError();
+		}
+		for (const directory of listOwnerDirectories(this.registryDir)) {
+			if (directory === this.ownerDirectory) {
+				continue;
+			}
+			const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, this.record));
+			if (owner && ownerConflicts(owner, this.record)) {
+				throw this.ownershipLostError();
+			}
+		}
+		mkdirSync(this.ownerDirectory, { recursive: true, mode: 0o700 });
+		this.record.updatedAt = new Date().toISOString();
+		writeOwnerScope(this.ownerDirectory, this.record);
+		writeOwnerRecord(this.ownerDirectory, this.record);
 	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
@@ -215,6 +282,7 @@ class DaemonSupervisorOwnership {
 		if (this.released) {
 			return;
 		}
+		await this.renewal.stop();
 		let releasedDirectory: string | undefined;
 		try {
 			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
